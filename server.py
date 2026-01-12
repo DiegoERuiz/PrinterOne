@@ -985,6 +985,7 @@ class PrinterOneGUI:
                 self.init_logger.info("Binding window events...")
             
             self.root.protocol("WM_DELETE_WINDOW", self.on_closing)
+            self.root.bind("<Unmap>", self.on_minimize)
             
             if self.init_logger:
                 self.init_logger.info("Window events binding completed")
@@ -1528,6 +1529,11 @@ If you can see this printed output, the PrinterOne server is working correctly!
             self.hide_window()
         else:
             self.quit_app()
+
+    def on_minimize(self, event):
+        """Minimizar a la bandeja al minimizar la ventana"""
+        if self.root.state() == "iconic" and self.minimize_to_tray and TRAY_AVAILABLE:
+            self.hide_window()
     
     def on_minimize_option_changed(self):
         """Handle minimize to tray option change"""
