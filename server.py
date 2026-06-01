@@ -250,23 +250,23 @@ class PrinterOneServer:
                 pass
             
             log_entry = f"""
-================================================================================
-TIMESTAMP: {timestamp}
-STATUS: {status}
-PRINTER: {printer_name}
-CLIENT IP: {client_address[0]}
-CLIENT PORT: {client_address[1]}
-DATA SIZE: {data_length} bytes
-DATA FORMAT: {data_format}
-================================================================================
-HEX PREVIEW (first 100 bytes):
-{' '.join(hex_preview[i:i+2] for i in range(0, len(hex_preview), 2))}
+                ================================================================================
+                TIMESTAMP: {timestamp}
+                STATUS: {status}
+                PRINTER: {printer_name}
+                CLIENT IP: {client_address[0]}
+                CLIENT PORT: {client_address[1]}
+                DATA SIZE: {data_length} bytes
+                DATA FORMAT: {data_format}
+                ================================================================================
+                HEX PREVIEW (first 100 bytes):
+                {' '.join(hex_preview[i:i+2] for i in range(0, len(hex_preview), 2))}
 
-ASCII PREVIEW (first 100 bytes):
-{ascii_preview}
+                ASCII PREVIEW (first 100 bytes):
+                {ascii_preview}
 
-FULL HEX DUMP:
-"""
+                FULL HEX DUMP:
+                """
             
             # Add full hex dump
             if raw_data:
