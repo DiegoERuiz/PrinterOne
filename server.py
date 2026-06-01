@@ -156,6 +156,9 @@ class PrinterOneServer:
             self.running = False
             self.log_callback = log_callback  # Callback function for logging to GUI
             
+            # Setup printer data logger
+            self.printer_logger = self.setup_printer_logger()
+            
             if startup_logger:
                 startup_logger.info("PrinterOneServer initialized successfully")
                 
@@ -165,6 +168,42 @@ class PrinterOneServer:
                 startup_logger.critical(error_msg)
                 startup_logger.critical(f"Traceback: {traceback.format_exc()}")
             raise
+    
+    def setup_printer_logger(self):
+        """Setup logger for printer data"""
+        try:
+            logs_dir = "logs"
+            try:
+                if not os.path.exists(logs_dir):
+                    os.makedirs(logs_dir)
+            except PermissionError:
+                import tempfile
+                logs_dir = os.path.join(tempfile.gettempdir(), "PrinterOne", "logs")
+                if not os.path.exists(logs_dir):
+                    os.makedirs(logs_dir, exist_ok=True)
+            
+            printer_logger = logging.getLogger('printer_data')
+            printer_logger.setLevel(logging.INFO)
+            
+            # Remove existing handlers to avoid duplicates
+            for handler in printer_logger.handlers[:]:
+                printer_logger.removeHandler(handler)
+            
+            # Create printer data log file
+            timestamp = datetime.now().strftime("%Y%m%d")
+            printer_log_filename = f"{timestamp}_printer_data.log"
+            printer_log_path = os.path.join(logs_dir, printer_log_filename)
+            
+            file_handler = logging.FileHandler(printer_log_path, encoding='utf-8')
+            file_handler.setLevel(logging.INFO)
+            formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+            file_handler.setFormatter(formatter)
+            printer_logger.addHandler(file_handler)
+            
+            return printer_logger
+        except Exception as e:
+            print(f"Error setting up printer logger: {e}")
+            return logging.getLogger('printer_data')
     
     def log(self, message):
         """Log message to console and GUI if callback is set"""
@@ -178,6 +217,89 @@ class PrinterOneServer:
                 if bracket_end != -1:
                     clean_message = message[bracket_end + 1:].strip()
             self.log_callback(clean_message)
+    
+    def log_printer_data(self, printer_name, client_address, data_length, data_format, raw_data, success):
+        """Log detailed printer data to printer data log file"""
+        try:
+            logs_dir = "logs"
+            try:
+                if not os.path.exists(logs_dir):
+                    os.makedirs(logs_dir)
+            except PermissionError:
+                import tempfile
+                logs_dir = os.path.join(tempfile.gettempdir(), "PrinterOne", "logs")
+                if not os.path.exists(logs_dir):
+                    os.makedirs(logs_dir, exist_ok=True)
+            
+            # Create printer-specific log
+            printer_safe_name = "".join(c if c.isalnum() or c in '-_' else '_' for c in printer_name)
+            timestamp_date = datetime.now().strftime("%Y%m%d")
+            printer_log_filename = f"{timestamp_date}_{printer_safe_name}_data.log"
+            printer_log_path = os.path.join(logs_dir, printer_log_filename)
+            
+            # Prepare log entry
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            status = "SUCCESS" if success else "FAILED"
+            hex_preview = raw_data[:100].hex() if raw_data else ""
+            ascii_preview = ""
+            try:
+                ascii_preview = raw_data[:100].decode('utf-8', errors='ignore') if raw_data else ""
+                # Replace non-printable characters
+                ascii_preview = ''.join(c if 32 <= ord(c) <= 126 else f'[{ord(c):02x}]' for c in ascii_preview)
+            except:
+                pass
+            
+            log_entry = f"""
+================================================================================
+TIMESTAMP: {timestamp}
+STATUS: {status}
+PRINTER: {printer_name}
+CLIENT IP: {client_address[0]}
+CLIENT PORT: {client_address[1]}
+DATA SIZE: {data_length} bytes
+DATA FORMAT: {data_format}
+================================================================================
+HEX PREVIEW (first 100 bytes):
+{' '.join(hex_preview[i:i+2] for i in range(0, len(hex_preview), 2))}
+
+ASCII PREVIEW (first 100 bytes):
+{ascii_preview}
+
+FULL HEX DUMP:
+"""
+            
+            # Add full hex dump
+            if raw_data:
+                hex_data = raw_data.hex()
+                for i in range(0, len(hex_data), 32):
+                    line = hex_data[i:i+32]
+                    formatted_line = ' '.join([line[j:j+2] for j in range(0, len(line), 2)])
+                    log_entry += f"{formatted_line}\n"
+            
+            log_entry += "================================================================================\n"
+            
+            # Write to printer-specific log file
+            try:
+                with open(printer_log_path, 'a', encoding='utf-8') as f:
+                    f.write(log_entry)
+            except PermissionError:
+                # Fallback to temp directory
+                temp_logs_dir = os.path.join(tempfile.gettempdir(), "PrinterOne", "logs")
+                os.makedirs(temp_logs_dir, exist_ok=True)
+                printer_log_path = os.path.join(temp_logs_dir, printer_log_filename)
+                with open(printer_log_path, 'a', encoding='utf-8') as f:
+                    f.write(log_entry)
+            
+            # Also log to the general printer data logger
+            summary = f"Printer: {printer_name} | Client: {client_address[0]}:{client_address[1]} | Size: {data_length} bytes | Format: {data_format} | Status: {status}"
+            self.printer_logger.info(summary)
+            
+            self.log(f"[LOG] Printer data logged to {printer_log_filename}")
+            
+        except Exception as e:
+            self.log(f"[!] Error logging printer data: {e}")
+            if startup_logger:
+                startup_logger.error(f"Error logging printer data: {e}")
     
     def load_config(self):
         """Load configuration from config.json (multi-printer support)"""
@@ -488,7 +610,7 @@ class PrinterOneServer:
             
             return f"Binary/Unknown format ({len(data)} bytes)"
     
-    def print_raw(self, data, printer_name):
+    def print_raw(self, data, printer_name, client_address=None):
         """Send raw data to printer"""
         try:
             self.log(f"[INFO] Opening printer: {printer_name}")
@@ -503,9 +625,23 @@ class PrinterOneServer:
             win32print.ClosePrinter(hPrinter)
             
             self.log(f"[OK] Successfully printed {len(data)} bytes.")
+            
+            # Log the data sent to printer
+            data_format = self.analyze_raw_data(data)
+            if client_address is None:
+                client_address = ("Unknown", 0)
+            self.log_printer_data(printer_name, client_address, len(data), data_format, data, True)
+            
             return True
         except Exception as e:
             self.log(f"[!] Print error: {e}")
+            
+            # Log the failed print attempt
+            data_format = self.analyze_raw_data(data)
+            if client_address is None:
+                client_address = ("Unknown", 0)
+            self.log_printer_data(printer_name, client_address, len(data), data_format, data, False)
+            
             return False
     
     
@@ -716,7 +852,7 @@ class PrinterOneServer:
                 self.log(f"[DATA] Received {len(data)} bytes from {address} (printer: {printer_name})")
                 self.log(f"[INFO] Data format: {self.analyze_raw_data(data)}")
                 if printer_name:
-                    self.print_raw(data, printer_name)
+                    self.print_raw(data, printer_name, client_address=address)
                 else:
                     self.log(f"[!] No printer configured")
             else:
