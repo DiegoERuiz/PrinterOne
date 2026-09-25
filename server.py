@@ -138,6 +138,33 @@ except ImportError:
 SERVER_RUNNING = True
 AUTO_START_MODE = False
 
+APP_NAME = "PrinterOne"
+STARTUP_VALUE_NAME = "PrinterOne"
+RUN_REGISTRY_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+
+
+def get_app_data_dir():
+    """Return a stable, writable directory independent of the current folder."""
+    base_dir = (
+        os.environ.get("APPDATA")
+        or os.environ.get("LOCALAPPDATA")
+        or os.path.expanduser("~")
+        or tempfile.gettempdir()
+    )
+    return os.path.join(base_dir, APP_NAME)
+
+
+def default_config():
+    """Create a fresh configuration. New installations have no printers."""
+    return {
+        "printers": [],
+        "auto_start": False,
+        "service_name": APP_NAME,
+        "service_description": "PrinterOne - Network print server for raw print data",
+        "manual": False,
+        "minimize_to_tray": True,
+    }
+
 class PrinterOneServer:
     """PrinterOne TCP Server"""
     
@@ -303,56 +330,69 @@ class PrinterOneServer:
     
     def load_config(self):
         """Load configuration from config.json (multi-printer support)"""
-        default_config = {
-            "printers": [
-                {
-                    "printer_name": "",
-                    "port": 9100,
-                    "use_pdf_conversion": True,
-                    "save_pdf_file": False
-                }
-            ],
-            "auto_start": False,
-            "service_name": "PrinterOne",
-            "service_description": "PrinterOne - Network print server for raw print data",
-            "manual": False,
-            "minimize_to_tray": True
-        }
-        config_paths = [
-            'config.json',
-            os.path.join(os.path.expanduser('~'), 'PrinterOne', 'config.json'),
-            os.path.join(os.environ.get('APPDATA', ''), 'PrinterOne', 'config.json'),
-            os.path.join(tempfile.gettempdir(), 'PrinterOne', 'config.json')
+        defaults = default_config()
+        canonical_path = os.path.join(get_app_data_dir(), "config.json")
+        self.config_path = canonical_path
+
+        # Older versions saved beside the EXE or in the process working folder.
+        legacy_base = os.path.dirname(
+            os.path.abspath(sys.executable if getattr(sys, "frozen", False) else __file__)
+        )
+        candidates = [canonical_path, os.path.join(legacy_base, "config.json")]
+        working_config = os.path.abspath("config.json")
+        if working_config not in candidates:
+            candidates.append(working_config)
+
+        config = None
+        loaded_from = None
+        for config_path in candidates:
+            if not os.path.isfile(config_path):
+                continue
+            try:
+                with open(config_path, "r", encoding="utf-8") as config_file:
+                    config = json.load(config_file)
+                loaded_from = config_path
+                break
+            except (OSError, ValueError) as exc:
+                if startup_logger:
+                    startup_logger.warning("Could not load %s: %s", config_path, exc)
+
+        had_printers_key = isinstance(config, dict) and "printers" in config
+        if not isinstance(config, dict):
+            config = {}
+        for key, value in defaults.items():
+            config.setdefault(key, value)
+
+        printers = config.get("printers")
+        if not isinstance(printers, list):
+            printers = []
+
+        # Migrate the old single-printer format only when no list existed.
+        if not printers and not had_printers_key:
+            legacy_name = str(config.get("printer_name", "")).strip()
+            if legacy_name:
+                printers = [{
+                    "printer_name": legacy_name,
+                    "port": config.get("port", 9100),
+                    "use_pdf_conversion": config.get("use_pdf_conversion", True),
+                    "save_pdf_file": config.get("save_pdf_file", False),
+                }]
+
+        # Empty placeholder rows from previous versions are not printers.
+        config["printers"] = [
+            printer for printer in printers
+            if isinstance(printer, dict) and str(printer.get("printer_name", "")).strip()
         ]
-        self.config_path = None
-        try:
-            for config_path in config_paths:
-                config_path = os.path.abspath(config_path)
-                if os.path.exists(config_path):
-                    with open(config_path, 'r') as f:
-                        config = json.load(f)
-                    for key, value in default_config.items():
-                        if key not in config:
-                            config[key] = value
-                    if not isinstance(config.get("printers", []), list):
-                        config["printers"] = default_config["printers"]
-                    self.config_path = config_path
-                    return config
-        except Exception as e:
-            self.log(f"[!] Error loading config: {e}")
-        if not self.config_path:
-            for base_path in [os.path.expanduser('~'), os.environ.get('APPDATA', ''), tempfile.gettempdir()]:
-                try:
-                    config_dir = os.path.join(base_path, 'PrinterOne')
-                    if not os.path.exists(config_dir):
-                        os.makedirs(config_dir, exist_ok=True)
-                    self.config_path = os.path.join(config_dir, 'config.json')
-                    break
-                except:
-                    continue
-            if not self.config_path:
-                self.config_path = os.path.join(tempfile.gettempdir(), 'PrinterOne_config.json')
-        return default_config
+
+        if loaded_from and os.path.abspath(loaded_from) != os.path.abspath(canonical_path):
+            try:
+                os.makedirs(os.path.dirname(canonical_path), exist_ok=True)
+                with open(canonical_path, "w", encoding="utf-8") as config_file:
+                    json.dump(config, config_file, indent=4, ensure_ascii=False)
+            except OSError as exc:
+                if startup_logger:
+                    startup_logger.warning("Could not migrate configuration: %s", exc)
+        return config
     
     def save_config(self, printers=None):
         """Save configuration to config.json (multi-printer support)"""
@@ -360,22 +400,17 @@ class PrinterOneServer:
             if printers is not None:
                 self.config["printers"] = printers
             self.config["manual"] = True
-            config_paths_to_try = []
-            if hasattr(self, 'config_path') and self.config_path:
-                config_paths_to_try.append(self.config_path)
-            config_paths_to_try.extend([
-                'config.json',
-                os.path.join(os.path.expanduser('~'), 'PrinterOne', 'config.json'),
-                os.path.join(os.environ.get('APPDATA', ''), 'PrinterOne', 'config.json'),
-                os.path.join(tempfile.gettempdir(), 'PrinterOne', 'config.json')
-            ])
+            config_paths_to_try = [
+                getattr(self, "config_path", os.path.join(get_app_data_dir(), "config.json")),
+                os.path.join(tempfile.gettempdir(), APP_NAME, "config.json"),
+            ]
             for config_path in config_paths_to_try:
                 try:
                     config_dir = os.path.dirname(config_path)
                     if config_dir and not os.path.exists(config_dir):
                         os.makedirs(config_dir, exist_ok=True)
-                    with open(config_path, 'w') as f:
-                        json.dump(self.config, f, indent=4)
+                    with open(config_path, 'w', encoding='utf-8') as f:
+                        json.dump(self.config, f, indent=4, ensure_ascii=False)
                     self.log(f"[SAVE] Configuration saved to {config_path}")
                     self.config_path = config_path
                     return True
@@ -645,34 +680,6 @@ class PrinterOneServer:
             return False
     
     
-    def handle_client(self, client_socket, address):
-        """Handle a client connection"""
-        self.log(f"[CONN] Client connected: {address}")
-        try:
-            data = b""
-            while True:
-                chunk = client_socket.recv(4096)
-                if not chunk:
-                    break
-                data += chunk
-            
-            if data:
-                self.log(f"[DATA] Received {len(data)} bytes from {address}")
-                self.log(f"[INFO] Data format: {self.analyze_raw_data(data)}")
-                printer_name = self.config.get("printer_name", "")
-                if printer_name:
-                    self.print_raw(data, printer_name)
-                else:
-                    self.log(f"[!] No printer configured")
-            else:
-                self.log(f"[!] No data received from {address}")
-                
-        except Exception as e:
-            self.log(f"[!] Error handling client {address}: {e}")
-        finally:
-            client_socket.close()
-            self.log(f"[CONN] Client disconnected: {address}")
-    
     def kill_process_on_port(self, port):
         """Kill any process using the specified port"""
         try:
@@ -789,12 +796,14 @@ class PrinterOneServer:
     def start_server(self):
         """Start TCP print servers for all configured printers"""
         global SERVER_RUNNING
+        if self.running and getattr(self, "server_sockets", {}):
+            self.log("[WARN] The server is already running")
+            return False
         SERVER_RUNNING = True
         printers = self.config.get("printers", [])
         if not printers or not any(p.get("printer_name") for p in printers):
             self.log("[!] No printers configured!")
             return False
-        self.running = True
         self.server_sockets = {}
         self.server_threads = {}
         for printer_cfg in printers:
@@ -819,8 +828,10 @@ class PrinterOneServer:
                 self.log(f"[IP] Local IP: {local_ip}")
                 self.log(f"[CONNECT] Other machines can connect to: {local_ip}:{port}")
             except Exception as e:
+                server_socket.close()
                 self.log(f"[!] Server error on port {port}: {e}")
-        return True
+        self.running = bool(self.server_sockets)
+        return self.running
 
     def _server_loop(self, server_socket, printer_name, port):
         while SERVER_RUNNING and self.running:
@@ -924,7 +935,7 @@ class AutoStartManager:
     def find_manager_exe():
         """Find PrinterOne Manager GUI executable"""
         # Check if running from exe (PyInstaller)
-        if hasattr(sys, '_MEIPASS'):
+        if getattr(sys, "frozen", False):
             # Running from exe - use sys.executable which points to exe
             exe_path = os.path.abspath(sys.executable)
             # For exe files, we need to include parameters as part of the command
@@ -942,17 +953,20 @@ class AutoStartManager:
             registry_path = AutoStartManager.find_manager_exe()
             
             # Add to Windows startup registry
-            key = winreg.OpenKey(
+            key = winreg.CreateKeyEx(
                 winreg.HKEY_CURRENT_USER,
-                r"Software\Microsoft\Windows\CurrentVersion\Run",
+                RUN_REGISTRY_KEY,
                 0,
                 winreg.KEY_SET_VALUE
             )
-            
-            winreg.SetValueEx(key, "PrinterOneManager", 0, winreg.REG_SZ, registry_path)
-            winreg.CloseKey(key)
-            
-            return True, f"PrinterOne Manager added to Windows startup!"
+            with key:
+                winreg.SetValueEx(key, STARTUP_VALUE_NAME, 0, winreg.REG_SZ, registry_path)
+                try:
+                    winreg.DeleteValue(key, "PrinterOneManager")
+                except FileNotFoundError:
+                    pass
+
+            return True, "PrinterOne se iniciará al entrar en Windows."
             
         except Exception as e:
             return False, f"Error adding to startup: {e}"
@@ -963,15 +977,19 @@ class AutoStartManager:
         try:
             key = winreg.OpenKey(
                 winreg.HKEY_CURRENT_USER,
-                r"Software\Microsoft\Windows\CurrentVersion\Run",
+                RUN_REGISTRY_KEY,
                 0,
                 winreg.KEY_SET_VALUE
             )
             
-            winreg.DeleteValue(key, "PrinterOneManager")
-            winreg.CloseKey(key)
-            
-            return True, "PrinterOne Manager removed from Windows startup!"
+            with key:
+                for value_name in (STARTUP_VALUE_NAME, "PrinterOneManager"):
+                    try:
+                        winreg.DeleteValue(key, value_name)
+                    except FileNotFoundError:
+                        pass
+
+            return True, "PrinterOne ya no se iniciará con Windows."
             
         except Exception as e:
             return False, f"Error removing from startup: {e}"
@@ -982,18 +1000,21 @@ class AutoStartManager:
         try:
             key = winreg.OpenKey(
                 winreg.HKEY_CURRENT_USER,
-                r"Software\Microsoft\Windows\CurrentVersion\Run",
+                RUN_REGISTRY_KEY,
                 0,
                 winreg.KEY_READ
             )
             
             try:
-                value, _ = winreg.QueryValueEx(key, "PrinterOneManager")
-                winreg.CloseKey(key)
+                try:
+                    value, _ = winreg.QueryValueEx(key, STARTUP_VALUE_NAME)
+                except FileNotFoundError:
+                    value, _ = winreg.QueryValueEx(key, "PrinterOneManager")
                 return True, value
             except FileNotFoundError:
-                winreg.CloseKey(key)
                 return False, "Not in startup"
+            finally:
+                winreg.CloseKey(key)
                 
         except Exception as e:
             return False, f"Error checking startup status: {e}"
@@ -1067,8 +1088,6 @@ class PrinterOneGUI:
             if self.init_logger:
                 self.init_logger.info("Setting up GUI variables...")
             
-            self.printer_var = tk.StringVar(value=self.server.config.get("printer_name", ""))
-            self.port_var = tk.IntVar(value=self.server.config.get("port", 9100))
             self.test_host_var = tk.StringVar(value="localhost")
             self.test_port_var = tk.IntVar(value=9100)
             
@@ -1160,17 +1179,8 @@ class PrinterOneGUI:
                 if self.init_logger:
                     self.init_logger.info("Scheduling server start in 2 seconds")
                 self.root.after(2000, self.auto_start_server)
-            else:
-                # Auto-start server if printer is configured
-                printer_name = self.server.config.get("printer_name", "")
-                if printer_name and printer_name.strip():
-                    if self.init_logger:
-                        self.init_logger.info(f"Printer configured ({printer_name}), scheduling auto-start in 1 second")
-                    self.log_message("Printer configured, auto-starting server...")
-                    self.root.after(1000, self.auto_start_server)
-                else:
-                    if self.init_logger:
-                        self.init_logger.info("No printer configured, server will not auto-start")
+            elif self.init_logger:
+                self.init_logger.info("Normal launch: waiting for the user to start the server")
             
             if self.init_logger:
                 self.init_logger.info("=== PrinterOneGUI Initialization Completed Successfully ===")
@@ -1486,7 +1496,7 @@ Includes a GUI management interface and test client with PDF conversion for test
     
     def start_server(self):
         """Iniciar el servidor para todas las impresoras"""
-        if hasattr(self, 'server_thread') and self.server_thread and self.server_thread.is_alive():
+        if self.server.running:
             self.log_message("[WARN] El servidor ya está en ejecución!")
             return
         # Guardar configuración antes de iniciar
@@ -1506,9 +1516,12 @@ Includes a GUI management interface and test client with PDF conversion for test
     def auto_start_server(self):
         """Auto-start server when launched from startup or when printer is configured"""
         try:
-            printer_name = self.server.config.get("printer_name", "")
-            
-            if not printer_name or not printer_name.strip():
+            configured_printers = [
+                printer for printer in self.server.config.get("printers", [])
+                if str(printer.get("printer_name", "")).strip()
+            ]
+
+            if not configured_printers:
                 if AUTO_START_MODE:
                     self.log_message("[WARN] Auto-start mode: No printer configured, running in system tray")
                 else:
@@ -1518,7 +1531,7 @@ Includes a GUI management interface and test client with PDF conversion for test
             if AUTO_START_MODE:
                 self.log_message("[AUTO] Auto-start mode: Starting server in background, check system tray...")
             else:
-                self.log_message("[AUTO] Auto-starting server with configured printer...")
+                self.log_message("[AUTO] Auto-starting configured print servers...")
             
             # Start server automatically
             self.start_server()
@@ -1839,7 +1852,7 @@ def run_console_mode():
     
     # Check if configuration exists
     config = server.config
-    if not config.get("printer_name"):
+    if not config.get("printers"):
         print("No printer configured. Please configure first:")
         printers = server.list_printers()
         
@@ -1866,12 +1879,19 @@ def run_console_mode():
         port_input = input("Enter port (default: 9100): ")
         port = int(port_input) if port_input.strip() else 9100
         
-        server.save_config(printer_name=selected_printer, port=port)
+        config["printers"] = [{
+            "printer_name": selected_printer,
+            "port": port,
+            "use_pdf_conversion": True,
+            "save_pdf_file": False,
+        }]
+        server.save_config(printers=config["printers"])
         print(f"[OK] Configuration saved: {selected_printer} on port {port}")
     
     # Start server
-    print(f"Starting server with printer: {config['printer_name']}")
-    print(f"Port: {config['port']}")
+    print("Starting configured print servers:")
+    for printer in config["printers"]:
+        print(f"  {printer['printer_name']}: port {printer.get('port', 9100)}")
     print("Press Ctrl+C to stop")
     print()
     
