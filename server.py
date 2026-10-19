@@ -811,6 +811,9 @@ class PrinterOneServer:
             port = printer_cfg.get("port", 9100)
             if not printer_name:
                 continue
+            if any(active_port == port for _, active_port in self.server_sockets):
+                self.log(f"[!] Port {port} is already assigned to another printer; use a different port for {printer_name}")
+                continue
             self.log(f"[KILL] Checking for processes using port {port}...")
             self.kill_process_on_port(port)
             server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -822,6 +825,7 @@ class PrinterOneServer:
                 self.server_sockets[(printer_name, port)] = server_socket
                 t = threading.Thread(target=self._server_loop, args=(server_socket, printer_name, port), daemon=True)
                 self.server_threads[(printer_name, port)] = t
+                self.running = True
                 t.start()
                 self.log(f"[OK] Server started on port {port} for printer: {printer_name}")
                 local_ip = self.get_local_ip()
@@ -1179,8 +1183,8 @@ class PrinterOneGUI:
                 if self.init_logger:
                     self.init_logger.info("Scheduling server start in 2 seconds")
                 self.root.after(2000, self.auto_start_server)
-            elif self.init_logger:
-                self.init_logger.info("Normal launch: waiting for the user to start the server")
+            else:
+                self.root.after(2000, self.auto_start_server)
             
             if self.init_logger:
                 self.init_logger.info("=== PrinterOneGUI Initialization Completed Successfully ===")
