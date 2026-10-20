@@ -948,6 +948,9 @@ class AutoStartManager:
             # Running from Python script
             current_script = os.path.abspath(__file__)
             python_exe = os.path.abspath(sys.executable)
+            pythonw_exe = os.path.join(os.path.dirname(python_exe), "pythonw.exe")
+            if os.path.exists(pythonw_exe):
+                python_exe = pythonw_exe
             return f'"{python_exe}" "{current_script}" gui auto_start'
     
     @staticmethod
@@ -1134,6 +1137,11 @@ class PrinterOneGUI:
             if self.init_logger:
                 self.init_logger.info("Updating initial status...")
             
+            is_in_startup, startup_command = AutoStartManager.check_startup_status()
+            if is_in_startup and startup_command != AutoStartManager.find_manager_exe():
+                success, message = AutoStartManager.add_to_startup()
+                if not success:
+                    self.log_message(f"[ERROR] {message}")
             self.update_status()
             
             if self.init_logger:
@@ -1967,17 +1975,21 @@ def run_gui_mode():
                 gui_logger.info("Checking for existing GUI instances...")
             
             current_pid = os.getpid()
+            protected_pids = {current_pid}
+            protected_pids.update(parent.pid for parent in psutil.Process(current_pid).parents())
+            current_exe = os.path.normcase(os.path.abspath(sys.executable))
             for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
                 try:
-                    if proc.info['pid'] == current_pid:
+                    if proc.info['pid'] in protected_pids:
                         continue
                     
                     process_name = proc.info['name'].lower()
                     cmdline = ' '.join(proc.info['cmdline']) if proc.info['cmdline'] else ''
                     
                     # Kill other GUI instances
-                    if ((process_name == 'python.exe' and 'server.py' in cmdline and 'gui' in cmdline) or
-                        process_name == 'printerone.exe'):
+                    if ((process_name in ('python.exe', 'pythonw.exe') and 'server.py' in cmdline and 'gui' in cmdline) or
+                        (getattr(sys, "frozen", False) and
+                         os.path.normcase(os.path.abspath(proc.exe())) == current_exe)):
                         if gui_logger:
                             gui_logger.info(f"Killing existing instance: {process_name} (PID: {proc.info['pid']})")
                         proc.terminate()
@@ -2008,6 +2020,8 @@ def run_gui_mode():
             gui_logger.info("Creating Tkinter root window...")
         
         root = tk.Tk()
+        if AUTO_START_MODE:
+            root.withdraw()
         
         if gui_logger:
             gui_logger.info("Tkinter root window created successfully")
