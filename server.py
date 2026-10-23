@@ -4,6 +4,11 @@ PrinterOne - Unified Server and GUI Application
 A comprehensive TCP print server with integrated GUI management and test client functionality
 """
 
+import multiprocessing
+
+if __name__ == "__main__":
+    multiprocessing.freeze_support()
+
 # Critical startup logging - Log everything from the very beginning
 import os
 import sys
@@ -19,6 +24,9 @@ import glob
 import psutil
 import winreg
 import traceback
+import queue
+from logging.handlers import RotatingFileHandler
+from print_queue import PrintQueue
 from datetime import datetime, timedelta
 
 # Setup early logging to capture startup issues
@@ -69,7 +77,7 @@ def setup_early_logging():
         return None
 
 # Initialize early logging
-startup_logger = setup_early_logging()
+startup_logger = setup_early_logging() if multiprocessing.current_process().name == 'MainProcess' else None
 
 try:
     if startup_logger:
@@ -181,10 +189,12 @@ class PrinterOneServer:
             self.server_socket = None
             self.server_thread = None
             self.running = False
+            self.state_lock = threading.Lock()
             self.log_callback = log_callback  # Callback function for logging to GUI
             
             # Setup printer data logger
             self.printer_logger = self.setup_printer_logger()
+            self.print_queue = PrintQueue(get_app_data_dir(), self.log)
             
             if startup_logger:
                 startup_logger.info("PrinterOneServer initialized successfully")
@@ -221,7 +231,7 @@ class PrinterOneServer:
             printer_log_filename = f"{timestamp}_printer_data.log"
             printer_log_path = os.path.join(logs_dir, printer_log_filename)
             
-            file_handler = logging.FileHandler(printer_log_path, encoding='utf-8')
+            file_handler = RotatingFileHandler(printer_log_path, maxBytes=5_000_000, backupCount=5, encoding='utf-8')
             file_handler.setLevel(logging.INFO)
             formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
             file_handler.setFormatter(formatter)
@@ -235,6 +245,8 @@ class PrinterOneServer:
     def log(self, message):
         """Log message to console and GUI if callback is set"""
         print(message)  # Always print to console
+        if hasattr(self, 'printer_logger'):
+            self.printer_logger.info(message)
         if self.log_callback:
             # Remove the timestamp and brackets from message for GUI (GUI adds its own)
             clean_message = message
@@ -626,7 +638,7 @@ class PrinterOneServer:
             return "PCL (HP)"
         elif data.startswith(b'%!PS'):
             return "PostScript"
-        elif data.startswith(b'\x02'):
+        elif b'^XA' in data[:4096] or data.startswith(b'\x02'):
             return "ZPL (Zebra)"
         elif b'PDF' in data[:100]:
             return "PDF document"
@@ -646,61 +658,15 @@ class PrinterOneServer:
             return f"Binary/Unknown format ({len(data)} bytes)"
     
     def print_raw(self, data, printer_name, client_address=None):
-        """Send raw data to printer"""
+        """Persist original bytes before the printer worker receives them."""
         try:
-            self.log(f"[INFO] Opening printer: {printer_name}")
-            hPrinter = win32print.OpenPrinter(printer_name)
-            
-            job_info = ("RAW Print Job", None, "RAW")
-            hJob = win32print.StartDocPrinter(hPrinter, 1, job_info)
-            win32print.StartPagePrinter(hPrinter)
-            win32print.WritePrinter(hPrinter, data)
-            win32print.EndPagePrinter(hPrinter)
-            win32print.EndDocPrinter(hPrinter)
-            win32print.ClosePrinter(hPrinter)
-            
-            self.log(f"[OK] Successfully printed {len(data)} bytes.")
-            
-            # Log the data sent to printer
-            data_format = self.analyze_raw_data(data)
-            if client_address is None:
-                client_address = ("Unknown", 0)
-            self.log_printer_data(printer_name, client_address, len(data), data_format, data, True)
-            
+            job_id = self.print_queue.enqueue(printer_name, 0, data)
+            self.log(f"[QUEUE] Job {job_id} persisted for {printer_name}")
             return True
-        except Exception as e:
-            self.log(f"[!] Print error: {e}")
-            
-            # Log the failed print attempt
-            data_format = self.analyze_raw_data(data)
-            if client_address is None:
-                client_address = ("Unknown", 0)
-            self.log_printer_data(printer_name, client_address, len(data), data_format, data, False)
-            
+        except Exception as exc:
+            self.log(f"[!] Could not queue print job: {exc}")
             return False
-    
-    
-    def kill_process_on_port(self, port):
-        """Kill any process using the specified port"""
-        try:
-            # Use psutil instead of netstat to avoid snmpapi.dll dependency
-            for conn in psutil.net_connections():
-                if conn.laddr.port == port and conn.status == psutil.CONN_LISTEN:
-                    try:
-                        process = psutil.Process(conn.pid)
-                        process.terminate()
-                        self.log(f"[KILL] Terminated process {conn.pid} ({process.name()}) using port {port}")
-                        time.sleep(1)
-                        
-                        # Force kill if still running
-                        if process.is_running():
-                            process.kill()
-                            self.log(f"[KILL] Force killed process {conn.pid}")
-                    except (psutil.NoSuchProcess, psutil.AccessDenied) as e:
-                        self.log(f"[!] Failed to kill process {conn.pid}: {e}")
-        except Exception as e:
-            self.log(f"[!] Error killing process on port {port}: {e}")
-    
+
     def get_local_ip(self):
         """Get the actual local IP address of the machine"""
         try:
@@ -794,103 +760,22 @@ class PrinterOneServer:
             return '127.0.0.1'
     
     def start_server(self):
-        """Start TCP print servers for all configured printers"""
+        """Start persistent workers and retrying TCP listeners."""
         global SERVER_RUNNING
-        if self.running and getattr(self, "server_sockets", {}):
-            self.log("[WARN] The server is already running")
-            return False
-        SERVER_RUNNING = True
-        printers = self.config.get("printers", [])
-        if not printers or not any(p.get("printer_name") for p in printers):
-            self.log("[!] No printers configured!")
-            return False
-        self.server_sockets = {}
-        self.server_threads = {}
-        for printer_cfg in printers:
-            printer_name = printer_cfg.get("printer_name", "")
-            port = printer_cfg.get("port", 9100)
-            if not printer_name:
-                continue
-            if any(active_port == port for _, active_port in self.server_sockets):
-                self.log(f"[!] Port {port} is already assigned to another printer; use a different port for {printer_name}")
-                continue
-            self.log(f"[KILL] Checking for processes using port {port}...")
-            self.kill_process_on_port(port)
-            server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-            server_socket.settimeout(1.0)
-            try:
-                server_socket.bind(('0.0.0.0', port))
-                server_socket.listen(5)
-                self.server_sockets[(printer_name, port)] = server_socket
-                t = threading.Thread(target=self._server_loop, args=(server_socket, printer_name, port), daemon=True)
-                self.server_threads[(printer_name, port)] = t
-                self.running = True
-                t.start()
-                self.log(f"[OK] Server started on port {port} for printer: {printer_name}")
-                local_ip = self.get_local_ip()
-                self.log(f"[IP] Local IP: {local_ip}")
-                self.log(f"[CONNECT] Other machines can connect to: {local_ip}:{port}")
-            except Exception as e:
-                server_socket.close()
-                self.log(f"[!] Server error on port {port}: {e}")
-        self.running = bool(self.server_sockets)
-        return self.running
+        with self.state_lock:
+            if self.running:
+                return False
+            self.running = self.print_queue.start(self.config.get("printers", []))
+            self.server_sockets = self.print_queue.sockets
+            SERVER_RUNNING = self.running
+            return self.running
 
-    def _server_loop(self, server_socket, printer_name, port):
-        while SERVER_RUNNING and self.running:
-            try:
-                client_socket, address = server_socket.accept()
-                client_thread = threading.Thread(
-                    target=self.handle_client_multi,
-                    args=(client_socket, address, printer_name),
-                    daemon=True
-                )
-                client_thread.start()
-            except socket.timeout:
-                continue
-            except Exception as e:
-                if self.running:
-                    self.log(f"[!] Error accepting client on port {port}: {e}")
-                break
-
-    def handle_client_multi(self, client_socket, address, printer_name):
-        self.log(f"[CONN] Client connected: {address} (printer: {printer_name})")
-        try:
-            data = b""
-            while True:
-                chunk = client_socket.recv(4096)
-                if not chunk:
-                    break
-                data += chunk
-            if data:
-                self.log(f"[DATA] Received {len(data)} bytes from {address} (printer: {printer_name})")
-                self.log(f"[INFO] Data format: {self.analyze_raw_data(data)}")
-                if printer_name:
-                    self.print_raw(data, printer_name, client_address=address)
-                else:
-                    self.log(f"[!] No printer configured")
-            else:
-                self.log(f"[!] No data received from {address}")
-        except Exception as e:
-            self.log(f"[!] Error handling client {address}: {e}")
-        finally:
-            client_socket.close()
-            self.log(f"[CONN] Client disconnected: {address}")
-    
     def stop_server(self):
-        """Stop all TCP print servers"""
         global SERVER_RUNNING
-        SERVER_RUNNING = False
-        self.running = False
-        for key, server_socket in getattr(self, 'server_sockets', {}).items():
-            try:
-                server_socket.close()
-            except:
-                pass
-        self.server_sockets = {}
-        self.server_threads = {}
-        self.log("[DONE] All servers stopped")
+        with self.state_lock:
+            SERVER_RUNNING = False
+            self.running = False
+            self.print_queue.shutdown()
 
 class TestClient:
     """Test client for the print server"""
@@ -914,7 +799,7 @@ class TestClient:
             # Send test data if provided
             if test_data is not None:
                 log(f"[SEND] Sending {len(test_data)} bytes...")
-                client_socket.send(test_data)
+                client_socket.sendall(test_data)
                 log(f"[OK] Data sent successfully!")
             else:
                 log(f"[OK] Connection test only - no data sent")
@@ -1085,7 +970,9 @@ class PrinterOneGUI:
             if self.init_logger:
                 self.init_logger.info("Initializing PrinterOneServer...")
             
-            self.server = PrinterOneServer(log_callback=self.log_message)
+            self.server_messages = queue.Queue(maxsize=2000)
+            self.server = PrinterOneServer(log_callback=self.post_server_message)
+            self.root.after(100, self.drain_server_messages)
             self.server_thread = None
             
             if self.init_logger:
@@ -1250,7 +1137,52 @@ class PrinterOneGUI:
         settings_frame = ttk.Frame(notebook)
         notebook.add(settings_frame, text="Settings")
         self.create_settings_tab(settings_frame)
+
+        jobs_frame = ttk.Frame(notebook)
+        notebook.add(jobs_frame, text="Trabajos")
+        self.create_jobs_tab(jobs_frame)
     
+    def post_server_message(self, message):
+        try:
+            self.server_messages.put_nowait(message)
+        except queue.Full:
+            pass
+
+    def drain_server_messages(self):
+        for _ in range(100):
+            try:
+                self.log_message(self.server_messages.get_nowait())
+            except queue.Empty:
+                break
+        self.root.after(100, self.drain_server_messages)
+
+    def create_jobs_tab(self, parent):
+        ttk.Label(parent, text="submitted: aceptado por Windows. uncertain: revisar etiquetas antes de continuar.").pack(pady=8)
+        columns = ("id", "created", "printer", "state", "bytes", "windows_id", "detail")
+        self.jobs_tree = ttk.Treeview(parent, columns=columns, show="headings", selectmode="browse")
+        for column in columns:
+            self.jobs_tree.heading(column, text=column)
+            self.jobs_tree.column(column, width=100)
+        scrollbar = ttk.Scrollbar(parent, orient="vertical", command=self.jobs_tree.yview)
+        self.jobs_tree.configure(yscrollcommand=scrollbar.set)
+        scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
+        self.jobs_tree.pack(fill=tk.BOTH, expand=True, padx=10)
+        ttk.Button(parent, text="Actualizar", command=self.refresh_jobs).pack(side=tk.LEFT, padx=10, pady=10)
+        ttk.Button(parent, text="Confirmar revisado (sin reenviar)", command=self.resolve_job).pack(side=tk.LEFT, padx=10, pady=10)
+        self.refresh_jobs()
+
+    def refresh_jobs(self):
+        self.jobs_tree.delete(*self.jobs_tree.get_children())
+        for row in self.server.print_queue.recent():
+            self.jobs_tree.insert("", "end", iid=str(row[0]), values=row)
+
+    def resolve_job(self):
+        from tkinter import messagebox
+        selected = self.jobs_tree.selection()
+        if selected and messagebox.askyesno("Revisar etiquetas", "¿Has comprobado físicamente este trabajo? Se desbloqueará la cola sin reenviarlo."):
+            self.server.print_queue.resolve(int(selected[0]))
+            self.refresh_jobs()
+
     def create_server_tab(self, parent):
         """Create server management tab (multi-printer)"""
         top_frame = ttk.Frame(parent)
@@ -1408,6 +1340,9 @@ class PrinterOneGUI:
         ttk.Button(button_frame, text="Send Test Data", 
                   command=lambda: self.send_test_data("test")).pack(side=tk.LEFT, padx=5)
         
+        ttk.Button(button_frame, text="Enviar prueba ZPL",
+                  command=lambda: self.send_test_data("zpl")).pack(side=tk.LEFT, padx=5)
+
         # Test log area
         log_frame = ttk.LabelFrame(test_data_frame, text="Test Log", padding="10")
         log_frame.pack(fill=tk.BOTH, expand=True, pady=(10, 0))
@@ -1557,12 +1492,13 @@ Includes a GUI management interface and test client with PDF conversion for test
     
     def update_server_status(self):
         """Actualizar estado de los servidores"""
-        if self.server.running and getattr(self.server, 'server_sockets', {}):
-            self.server_status_label.config(text="[OK] Servidores activos", foreground="green")
+        if self.server.running:
+            status = "[OK] Servidores activos" if self.server.server_sockets else "[WAIT] Reintentando puertos"
+            self.server_status_label.config(text=status, foreground="green")
             self.start_button.config(state="disabled")
             self.stop_button.config(state="normal")
             info = []
-            for (printer, port) in self.server.server_sockets:
+            for (printer, port) in list(self.server.server_sockets):
                 try:
                     local_ip = self.server.get_local_ip()
                     info.append(f"{printer}: {local_ip}:{port}")
@@ -1646,10 +1582,14 @@ If you can see this printed output, the PrinterOne server is working correctly!
 """
         
         # Check if target printer is PDF printer and convert data if needed
-        printer_name = self.server.config.get("printer_name", "")
-        use_pdf_conversion = self.server.config.get("use_pdf_conversion", True)
-        
-        if printer_name == "Microsoft Print to PDF" and use_pdf_conversion:
+        if data_type == "zpl":
+            test_data = b"^XA^FO40,40^A0N,30,30^FDPrinterOne ZPL Test^FS^XZ"
+        printer_cfg = next((p for p in self.server.config.get("printers", [])
+                            if p.get("port", 9100) == port), {})
+        printer_name = printer_cfg.get("printer_name", "")
+        use_pdf_conversion = printer_cfg.get("use_pdf_conversion", True)
+
+        if data_type != "zpl" and printer_name == "Microsoft Print to PDF" and use_pdf_conversion:
             self.log_test_message(f"[PDF] Converting test data to PDF for PDF printer...")
             try:
                 pdf_data = self.server.convert_raw_to_pdf(test_data, save_file=False)
@@ -1908,11 +1848,15 @@ def run_console_mode():
     print()
     
     try:
-        server.start_server()
+        if server.start_server():
+            while SERVER_RUNNING:
+                time.sleep(0.5)
     except KeyboardInterrupt:
         print("\n[STOP] Server stopped by user")
     except Exception as e:
         print(f"[!] Server error: {e}")
+    finally:
+        server.stop_server()
 
 def run_gui_mode():
     """Run in GUI mode"""
@@ -2085,7 +2029,8 @@ def show_help():
     print("=" * 35)
     print()
     print("Usage:")
-    print("  python server.py              - Run in console mode")
+    print("  python server.py              - Run with GUI")
+    print("  python server.py console      - Run in console mode")
     print("  python server.py gui          - Run with GUI")
     print("  python server.py gui auto_start - Run GUI in auto-start mode")
     print("  python server.py test         - Run test client")
@@ -2176,6 +2121,8 @@ def main():
                 if startup_logger:
                     startup_logger.info("Starting GUI mode")
                 run_gui_mode()
+            elif command == 'console':
+                run_console_mode()
             elif command == 'test':
                 if startup_logger:
                     startup_logger.info("Starting test mode")

@@ -8,6 +8,25 @@
 
 A comprehensive TCP network print server with integrated GUI management and system tray support for Windows.
 
+## Colas persistentes Zebra/ZPL
+
+- Una cola FIFO por nombre de impresora de Windows, compartida entre sus puertos. El orden corresponde al registro de trabajos recibidos completos, no al inicio de las conexiones.
+- Los bytes originales se guardan en SQLite antes del envío. No se convierte ZPL a PDF. Se conserva la conversión PDF de diagnóstico del cliente de pruebas y se añade **Enviar prueba ZPL**.
+- Límites: 16 MiB por trabajo, 32 conexiones simultáneas, 15 segundos para el primer byte, 8 segundos de inactividad y 120 segundos totales. El cliente debe cerrar la conexión o ejecutar `shutdown(SHUT_WR)` al terminar cada trabajo. Un tiempo de espera descarta el trabajo incompleto.
+- Cola pendiente limitada a 10.000 trabajos y 512 MiB de datos. SQLite conserva metadatos de trabajos terminados durante 30 días; los datos originales se liberan al aceptar Windows el trabajo o al confirmar su revisión.
+- Una instancia por usuario. Los puertos ocupados se reintentan cada 10 segundos sin terminar otros procesos. Los registros de actividad de la cola rotan a 5 MB con cinco copias.
+- Cada envío al spooler se ejecuta en un proceso separado, con límite de 60 segundos. Al detener el servidor, se cierran las conexiones y se detienen los procesos de envío; un reinicio espera a que los trabajadores anteriores terminen.
+
+En **Trabajos**, `queued` significa pendiente, `sending` significa en curso y `submitted` significa aceptado por Windows. Esto último no confirma la salida física de una etiqueta. Las [llamadas al spooler pueden bloquearse](https://learn.microsoft.com/windows/win32/printdocs/startdocprinter).
+
+Un error, interrupción o tiempo de espera durante el envío produce `uncertain` y bloquea esa impresora. Comprueba las etiquetas y la cola de Windows; después selecciona **Confirmar revisado (sin reenviar)** para permitir los siguientes trabajos. Si falta una etiqueta, envíala expresamente después de comprobar que no sigue pendiente en Windows. Los trabajos inciertos nunca se reenvían automáticamente; los pendientes de impresoras eliminadas permanecen almacenados hasta configurar de nuevo el mismo nombre.
+
+Los datos se guardan en `%APPDATA%\PrinterOne` (o `%LOCALAPPDATA%\PrinterOne` si APPDATA no existe). El protocolo RAW no devuelve confirmación de persistencia al cliente: que `sendall` termine tampoco confirma la impresión.
+
+Para el Programador de tareas, configura primero las impresoras en la GUI y ejecuta `py server.py console`, con rutas absolutas al intérprete y al script, bajo el mismo usuario que tiene instaladas las impresoras. En la versión compilada usa `PrinterOne.exe console`. Para mostrar la interfaz utiliza `gui auto_start` y la opción de ejecutar solo cuando ese usuario haya iniciado sesión. No es necesario que la carpeta de trabajo coincida con la de los datos.
+
+La integración requiere validación en Windows con una Zebra real antes de sustituir la instalación de producción.
+
 > ⚠️ **Quick Fix**: If server starts but clients can't connect, check if port 9100 is blocked by firewall. Consider using [SimpleWall](https://github.com/henrypp/simplewall) for easy firewall management.
 
 **Copyright (c) 2025 xtieume@gmail.com**  
